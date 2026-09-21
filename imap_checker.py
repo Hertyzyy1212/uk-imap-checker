@@ -21,7 +21,7 @@ if not st.session_state.authenticated:
     st.stop()
 
 # ==================================================
-# 🇬🇧 UK IMAP CHECKER — Accounts + Target Domain Search + All Neat Captures
+# 🇬🇧 UK IMAP CHECKER — File Upload + Target Domain Search + All Captures
 # ==================================================
 
 import imaplib
@@ -200,7 +200,7 @@ def check_imap(account, target_domains):
     return result
 
 # ==================================================
-# 🖥️ PAGE LAYOUT — EXACTLY YOUR SCREENSHOT STYLE
+# 🖥️ PAGE LAYOUT — WITH FILE UPLOAD IN ACCOUNTS SECTION
 # ==================================================
 st.set_page_config(page_title="UK IMAP Checker", layout="wide")
 st.title("📧 UK IMAP Checker — Auto-Detect + Inbox Search")
@@ -209,15 +209,34 @@ Auto-detects: **Virgin Media (ntlworld/blueyonder) • BT • TalkTalk • Sky �
 ⚠️ **ONLY for accounts you own or have written permission.**
 """)
 
-# --- 📝 SECTION 1: ACCOUNTS INPUT ---
+# --- 📝 SECTION 1: ENTER ACCOUNTS — WITH FILE UPLOAD ---
 st.subheader("Enter Accounts")
-st.caption("Format: `email:password` — one per line")
+st.caption("Format: `email:password` — one per line. Upload a .txt file OR paste below.")
+
+uploaded_file = st.file_uploader("📁 Upload Accounts File (.txt)", type="txt", label_visibility="collapsed")
 accounts_text = st.text_area(
-    "Accounts",
+    "Or Paste Accounts Below",
     height=180,
     placeholder="chrisstone063@btinternet.com:Bamfordeg5\nuser@gmail.com:password123",
-    label_visibility="collapsed"
+    label_visibility="visible"
 )
+
+# Parse accounts from file + text
+accounts = []
+# From uploaded file
+if uploaded_file:
+    content = uploaded_file.read().decode("utf-8", errors="ignore")
+    for line in content.splitlines():
+        acc = parse_line(line)
+        if acc:
+            accounts.append(acc)
+    st.success(f"✅ Loaded {len(accounts)} accounts from file!")
+# From text area
+if accounts_text.strip():
+    for line in accounts_text.strip().split("\n"):
+        acc = parse_line(line)
+        if acc:
+            accounts.append(acc)
 
 # --- 🎯 SECTION 2: TARGET DOMAIN SEARCH ---
 st.subheader("🔍 Search Inbox FOR THESE DOMAINS")
@@ -239,13 +258,6 @@ with col2:
 
 # --- 🚀 RUN CHECKS ---
 if start_btn:
-    # Parse accounts
-    accounts = []
-    if accounts_text.strip():
-        for line in accounts_text.strip().split("\n"):
-            acc = parse_line(line)
-            if acc: accounts.append(acc)
-
     # Parse target domains
     target_domains = []
     if domains_text.strip():
@@ -255,7 +267,7 @@ if start_btn:
         target_domains = list(set(target_domains))  # Deduplicate
 
     if not accounts:
-        st.warning("⚠️ Enter at least one account first!")
+        st.warning("⚠️ Upload a file OR enter at least one account first!")
         st.stop()
 
     # Status summary
@@ -366,4 +378,4 @@ if start_btn:
     col_e.download_button("❓ Unknown Only", data=unknown_txt or "None", file_name=f"imap_unknown_{time.strftime('%Y%m%d_%H%M%S')}.txt")
 
 else:
-    st.info("👆 Enter accounts above, add target domains if needed, then click START CHECK.")
+    st.info("👆 Upload a .txt file OR enter accounts above, add target domains if needed, then click START CHECK.")
